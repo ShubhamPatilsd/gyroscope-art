@@ -1,82 +1,36 @@
-import { generateText } from "ai";
-import { createAnthropic } from "@ai-sdk/anthropic";
-import { MidiMessage } from "@/app/hooks/useMidi";
-import { analyzeMidi } from "@/lib/midi-analyzer";
-import { disturberTools } from "@/lib/disturber-tools";
+// TODO: re-enable Orba MIDI disturbance when instrument is connected
+// import { generateText } from "ai";
+// import { createAnthropic } from "@ai-sdk/anthropic";
+// import { MidiMessage } from "@/app/hooks/useMidi";
+// import { analyzeMidi } from "@/lib/midi-analyzer";
+// import { disturberTools } from "@/lib/disturber-tools";
 
-const anthropic = createAnthropic();
-const model = anthropic("claude-3-5-sonnet-20241022");
+// Cursor movement threshold — total UV-space distance over the window.
+// Moving slowly across the full screen ≈ 0.3–0.5. Below 0.05 is basically idle.
+const IDLE_THRESHOLD = 0.05;
 
 export async function POST(request: Request) {
   try {
-    const { messages } = (await request.json()) as { messages: MidiMessage[] };
+    const { cursorMovement, windowSeconds } = (await request.json()) as {
+      cursorMovement: number;
+      windowSeconds: number;
+    };
 
-    if (!messages || messages.length === 0) {
-      return Response.json({
-        action: "none",
-        reason: "no MIDI data received",
-      });
+    const isIdle = cursorMovement < IDLE_THRESHOLD;
+
+    if (!isIdle) {
+      return Response.json({ action: "none", cursorMovement, windowSeconds });
     }
-
-    const metrics = analyzeMidi(messages);
-
-    // If not static, don't disturb
-    if (!metrics.isStatic) {
-      return Response.json({
-        action: "none",
-        reason: "art is active and expressive, no disturbance needed",
-        metrics,
-      });
-    }
-
-    // Art is too static — ask the agent what to do
-    const prompt = `
-You are a mischievous art "disturber" that ruins art when it gets too static or boring.
-
-The artist has been playing an instrument (Orba) and creating art on a canvas.
-But the playing has become STATIC: ${metrics.staticReason}
-
-Here are the detailed metrics from the last 5 seconds:
-- Event count: ${metrics.eventCount}
-- Note On events: ${metrics.noteOnCount}
-- Average velocity: ${metrics.averageVelocity}/127
-- Velocity range: ${metrics.velocityRange.min}-${metrics.velocityRange.max}
-- Pitch range: ${metrics.pitchRange.min}-${metrics.pitchRange.max}
-- Has control changes: ${metrics.hasControlChange}
-- Has pitch wheel: ${metrics.hasPitchWheel}
-- Events per second: ${metrics.eventDensity.toFixed(2)}
-
-Your job: Call tools to "disturb" the art and force the artist to be more creative.
-Be creative and unpredictable! Mix and match tools. The goal is to shake things up.
-You should call 1-3 tools depending on how static the art is.
-
-Only call the tools, don't explain — just execute the disturbance.
-`;
-
-    const result = await generateText({
-      model,
-      tools: disturberTools,
-      prompt,
-      maxSteps: 5,
-    });
-
-    // Extract tool use results
-    const toolResults = result.toolResults || [];
-    const disturbances = toolResults.map((tr) => tr.result);
 
     return Response.json({
       action: "disturb",
-      reason: metrics.staticReason,
-      disturbances,
-      metrics,
+      reason: `cursor barely moved (${cursorMovement.toFixed(4)} UV units in ${windowSeconds}s)`,
+      disturbances: [{ action: "change_palette", paletteType: "grayscale" }],
     });
   } catch (error) {
     console.error("Disturber error:", error);
     return Response.json(
-      {
-        action: "error",
-        error: error instanceof Error ? error.message : "Unknown error",
-      },
+      { action: "error", error: error instanceof Error ? error.message : "Unknown error" },
       { status: 500 }
     );
   }

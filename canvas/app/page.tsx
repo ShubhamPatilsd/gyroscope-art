@@ -1,418 +1,570 @@
 "use client";
+import { useEffect, useRef } from "react";
 
-import { useEffect, useRef, useState, useCallback } from "react";
-import { useMidi } from "./hooks/useMidi";
-import { useDisturber, type Disturbance } from "./hooks/useDisturber";
+// ======================== CONFIG ========================
 
-function drawSplat(
-  ctx: CanvasRenderingContext2D,
-  width: number,
-  height: number,
-  v1: number, v2: number, v3: number, v4: number, v5: number,
-  v6: number, v7: number, v8: number, v9: number, v10: number,
-  v11: number, v12: number, v13: number, v14: number, v15: number,
-  v16: number, v17: number
-) {
-  const x           = v1 * width;
-  const y           = v2 * height;
-  const scale       = 10 + v3 * 300;
-  const aspectX     = 0.5 + v4 * 2;
-  const aspectY     = 0.5 + v5 * 2;
-  const rotation    = v6 * Math.PI * 2;
-  const skewX       = (v7 - 0.5) * 1.0;
-  const skewY       = (v8 - 0.5) * 1.0;
-  const n           = 1 + v9 * 9;
-  const hue         = v10 * 360;
-  const sat         = 40 + v11 * 60;
-  const light       = 30 + v12 * 40;
-  const opacity     = 0.02 + v13 * 0.4;
-  const hue2        = (hue + v14 * 180) % 360;
-  const colorStop   = 0.1 + v15 * 0.8;
-  const innerRadius = v16 * 0.9;
-  const falloff     = 0.5 + v17 * 2;
+const SIM_RES = 256;
+const DYE_RES = 1024;
+const PRESSURE_ITERS = 20;
+const CURL_STRENGTH = 30;
+const SPLAT_RADIUS = 0.0025;
+const SPLAT_FORCE = 6000;
+const VEL_DISSIPATION = 0.2;
+const DYE_DISSIPATION = 0.4;
+const PRESSURE_DISSIPATION = 0.8;
 
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.rotate(rotation);
-  ctx.scale(aspectX, aspectY);
-  ctx.transform(1, skewY, skewX, 1, 0, 0);
+// ======================== SHADERS ========================
 
-  ctx.beginPath();
-  const steps = 64;
-  for (let i = 0; i <= steps; i++) {
-    const theta = (i / steps) * Math.PI * 2;
-    const cos = Math.cos(theta);
-    const sin = Math.sin(theta);
-    const r = scale;
-    const px = Math.sign(cos) * Math.pow(Math.abs(cos), 2 / n) * r;
-    const py = Math.sign(sin) * Math.pow(Math.abs(sin), 2 / n) * r;
-    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+const VS = `#version 300 es
+precision highp float;
+in vec2 aPos;
+out vec2 vUv;
+void main() {
+  vUv = aPos * 0.5 + 0.5;
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}`;
+
+const CLEAR_FS = `#version 300 es
+precision mediump float;
+in vec2 vUv;
+uniform sampler2D uTex;
+uniform float uValue;
+out vec4 fragColor;
+void main() {
+  fragColor = uValue * texture(uTex, vUv);
+}`;
+
+const SPLAT_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uTex;
+uniform float uAspect;
+uniform vec2 uPoint;
+uniform vec3 uColor;
+uniform float uRadius;
+out vec4 fragColor;
+void main() {
+  vec2 p = vUv - uPoint;
+  p.x *= uAspect;
+  vec3 splat = exp(-dot(p, p) / uRadius) * uColor;
+  fragColor = vec4(texture(uTex, vUv).rgb + splat, 1.0);
+}`;
+
+const ADVECT_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uVel;
+uniform sampler2D uSource;
+uniform vec2 uTexel;
+uniform float uDt;
+uniform float uDiss;
+out vec4 fragColor;
+void main() {
+  vec2 coord = vUv - uDt * texture(uVel, vUv).xy * uTexel;
+  fragColor = uDiss * texture(uSource, coord);
+}`;
+
+const DIVERGENCE_FS = `#version 300 es
+precision mediump float;
+in vec2 vUv;
+uniform sampler2D uVel;
+uniform vec2 uTexel;
+out vec4 fragColor;
+void main() {
+  float L = texture(uVel, vUv - vec2(uTexel.x, 0.0)).x;
+  float R = texture(uVel, vUv + vec2(uTexel.x, 0.0)).x;
+  float T = texture(uVel, vUv + vec2(0.0, uTexel.y)).y;
+  float B = texture(uVel, vUv - vec2(0.0, uTexel.y)).y;
+  fragColor = vec4(0.5 * (R - L + T - B), 0.0, 0.0, 1.0);
+}`;
+
+const CURL_FS = `#version 300 es
+precision mediump float;
+in vec2 vUv;
+uniform sampler2D uVel;
+uniform vec2 uTexel;
+out vec4 fragColor;
+void main() {
+  float L = texture(uVel, vUv - vec2(uTexel.x, 0.0)).y;
+  float R = texture(uVel, vUv + vec2(uTexel.x, 0.0)).y;
+  float T = texture(uVel, vUv + vec2(0.0, uTexel.y)).x;
+  float B = texture(uVel, vUv - vec2(0.0, uTexel.y)).x;
+  fragColor = vec4(0.5 * (R - L - T + B), 0.0, 0.0, 1.0);
+}`;
+
+const VORTICITY_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uVel;
+uniform sampler2D uCurl;
+uniform vec2 uTexel;
+uniform float uCurlStr;
+uniform float uDt;
+out vec4 fragColor;
+void main() {
+  float L = texture(uCurl, vUv - vec2(uTexel.x, 0.0)).x;
+  float R = texture(uCurl, vUv + vec2(uTexel.x, 0.0)).x;
+  float T = texture(uCurl, vUv + vec2(0.0, uTexel.y)).x;
+  float B = texture(uCurl, vUv - vec2(0.0, uTexel.y)).x;
+  float C = texture(uCurl, vUv).x;
+  vec2 f = 0.5 * vec2(abs(T) - abs(B), abs(R) - abs(L));
+  f /= length(f) + 1e-4;
+  f *= uCurlStr * C;
+  f.y *= -1.0;
+  fragColor = vec4(texture(uVel, vUv).xy + f * uDt, 0.0, 1.0);
+}`;
+
+const PRESSURE_FS = `#version 300 es
+precision mediump float;
+in vec2 vUv;
+uniform sampler2D uPres;
+uniform sampler2D uDiv;
+uniform vec2 uTexel;
+out vec4 fragColor;
+void main() {
+  float L = texture(uPres, vUv - vec2(uTexel.x, 0.0)).x;
+  float R = texture(uPres, vUv + vec2(uTexel.x, 0.0)).x;
+  float T = texture(uPres, vUv + vec2(0.0, uTexel.y)).x;
+  float B = texture(uPres, vUv - vec2(0.0, uTexel.y)).x;
+  float d = texture(uDiv, vUv).x;
+  fragColor = vec4((L + R + T + B - d) * 0.25, 0.0, 0.0, 1.0);
+}`;
+
+const GRADIENT_FS = `#version 300 es
+precision mediump float;
+in vec2 vUv;
+uniform sampler2D uPres;
+uniform sampler2D uVel;
+uniform vec2 uTexel;
+out vec4 fragColor;
+void main() {
+  float L = texture(uPres, vUv - vec2(uTexel.x, 0.0)).x;
+  float R = texture(uPres, vUv + vec2(uTexel.x, 0.0)).x;
+  float T = texture(uPres, vUv + vec2(0.0, uTexel.y)).x;
+  float B = texture(uPres, vUv - vec2(0.0, uTexel.y)).x;
+  fragColor = vec4(texture(uVel, vUv).xy - vec2(R - L, T - B), 0.0, 1.0);
+}`;
+
+const DISPLAY_FS = `#version 300 es
+precision mediump float;
+in vec2 vUv;
+uniform sampler2D uTex;
+uniform float uSaturation;
+out vec4 fragColor;
+void main() {
+  vec3 c = texture(uTex, vUv).rgb;
+  float grey = dot(c, vec3(0.299, 0.587, 0.114));
+  c = mix(vec3(grey), c, uSaturation);
+  fragColor = vec4(c, 1.0);
+}`;
+
+// ======================== HELPERS ========================
+
+type FBO = {
+  texture: WebGLTexture;
+  fbo: WebGLFramebuffer;
+  width: number;
+  height: number;
+  attach: (unit: number) => number;
+};
+
+type DoubleFBO = {
+  width: number;
+  height: number;
+  texelX: number;
+  texelY: number;
+  read: FBO;
+  write: FBO;
+  swap: () => void;
+};
+
+type Prog = {
+  program: WebGLProgram;
+  uniforms: Record<string, WebGLUniformLocation>;
+  bind: () => void;
+};
+
+function compileShader(gl: WebGL2RenderingContext, type: number, source: string): WebGLShader {
+  const s = gl.createShader(type)!;
+  gl.shaderSource(s, source);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s) || "shader compile error");
+  return s;
+}
+
+function makeProg(gl: WebGL2RenderingContext, vsSource: string, fsSource: string): Prog {
+  const p = gl.createProgram()!;
+  gl.attachShader(p, compileShader(gl, gl.VERTEX_SHADER, vsSource));
+  gl.attachShader(p, compileShader(gl, gl.FRAGMENT_SHADER, fsSource));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    throw new Error(gl.getProgramInfoLog(p) || "link error");
+
+  const uniforms: Record<string, WebGLUniformLocation> = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) {
+    const info = gl.getActiveUniform(p, i)!;
+    uniforms[info.name] = gl.getUniformLocation(p, info.name)!;
   }
-  ctx.closePath();
-
-  const grad = ctx.createRadialGradient(0, 0, innerRadius * scale, 0, 0, scale);
-  grad.addColorStop(0,         `hsla(${hue},  ${sat}%, ${light}%, ${opacity})`);
-  grad.addColorStop(colorStop, `hsla(${hue2}, ${sat}%, ${light}%, ${opacity * falloff})`);
-  grad.addColorStop(1,         `hsla(${hue2}, ${sat}%, ${light}%, 0)`);
-
-  ctx.fillStyle = grad;
-  ctx.fill();
-  ctx.restore();
+  return { program: p, uniforms, bind: () => gl.useProgram(p) };
 }
 
-function randomValues(): number[] {
-  return Array.from({ length: 17 }, () => Math.random());
+function makeFBO(
+  gl: WebGL2RenderingContext,
+  w: number,
+  h: number,
+  internalFmt: number,
+  fmt: number,
+  type: number,
+  filter: number
+): FBO {
+  const texture = gl.createTexture()!;
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internalFmt, w, h, 0, fmt, type, null);
+
+  const fbo = gl.createFramebuffer()!;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  return {
+    texture,
+    fbo,
+    width: w,
+    height: h,
+    attach(unit: number) {
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      return unit;
+    },
+  };
 }
 
-type ImuState = { x: number; y: number; vx: number; vy: number };
+function makeDoubleFBO(
+  gl: WebGL2RenderingContext,
+  w: number,
+  h: number,
+  internalFmt: number,
+  fmt: number,
+  type: number,
+  filter: number
+): DoubleFBO {
+  let fbo1 = makeFBO(gl, w, h, internalFmt, fmt, type, filter);
+  let fbo2 = makeFBO(gl, w, h, internalFmt, fmt, type, filter);
+  return {
+    width: w,
+    height: h,
+    texelX: 1 / w,
+    texelY: 1 / h,
+    get read() { return fbo1; },
+    get write() { return fbo2; },
+    swap() { [fbo1, fbo2] = [fbo2, fbo1]; },
+  };
+}
+
+function getRes(gl: WebGL2RenderingContext, res: number) {
+  const aspect = gl.canvas.width / gl.canvas.height;
+  return aspect > 1
+    ? { w: Math.round(res * aspect), h: res }
+    : { w: res, h: Math.round(res / aspect) };
+}
+
+function hslToRgb(h: number, s: number, l: number) {
+  h = ((h % 360) + 360) % 360;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+  const m = l - c / 2;
+  let r = 0, g = 0, b = 0;
+  if (h < 60) { r = c; g = x; }
+  else if (h < 120) { r = x; g = c; }
+  else if (h < 180) { g = c; b = x; }
+  else if (h < 240) { g = x; b = c; }
+  else if (h < 300) { r = x; b = c; }
+  else { r = c; b = x; }
+  return { r: r + m, g: g + m, b: b + m };
+}
+
+// ======================== COMPONENT ========================
 
 export default function Home() {
-  const canvasRef   = useRef<HTMLCanvasElement>(null);
-  const initialized = useRef(false);
-  const [open, setOpen]       = useState(false);
-  const [vals, setVals]       = useState<number[]>(randomValues());
-  const valsRef               = useRef(vals);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // IMU
-  const imuRef        = useRef<ImuState>({ x: 0.5, y: 0.5, vx: 0, vy: 0 });
-  const imuActive     = useRef(false);
-  const [imuEnabled, setImuEnabled] = useState(false);
-  const [imuDisplay, setImuDisplay] = useState({ x: 0.5, y: 0.5 });
-  const rafRef        = useRef<number | null>(null);
-  const lastMotionT   = useRef<number | null>(null);
-  const displayTimer  = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // MIDI
-  const { message, connected } = useMidi();
-  const midiThrottle = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // keep valsRef in sync with slider state
-  useEffect(() => { valsRef.current = vals; }, [vals]);
-
-  // --- canvas resize ---
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const resize = () => {
-      if (canvas.width === window.innerWidth && canvas.height === window.innerHeight) return;
-      canvas.width  = window.innerWidth;
-      canvas.height = window.innerHeight;
-      initialized.current = false;
-    };
-    canvas.width  = window.innerWidth;
+    const canvas = canvasRef.current!;
+    canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
-    window.addEventListener("resize", resize);
-    return () => window.removeEventListener("resize", resize);
-  }, []);
 
-  const initCanvas = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || initialized.current) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.fillStyle = "black";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    initialized.current = true;
-  }, []);
+    const gl = canvas.getContext("webgl2")!;
+    if (!gl) { alert("WebGL2 not supported"); return; }
+    gl.getExtension("EXT_color_buffer_float");
 
-  // --- MIDI → vals ---
-  useEffect(() => {
-    if (!message) return;
-    const next = [...valsRef.current];
+    // --- vertex buffer (full-screen quad) ---
+    const vao = gl.createVertexArray()!;
+    gl.bindVertexArray(vao);
+    const vbo = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(0);
 
-    if (message.type === "control_change") {
-      // CC 0–16 map directly to v1–v17
-      next[message.control % 17] = message.value / 127;
-    } else if (message.type === "pitchwheel") {
-      // –8192..8191 → 0..1 → rotation (v6)
-      next[5] = (message.pitch + 8192) / 16383;
-    } else if (message.type === "aftertouch") {
-      next[12] = message.value / 127; // opacity
-    } else if (message.type === "note_on") {
-      next[2] = message.velocity / 127; // scale
+    // --- compile programs ---
+    const progs = {
+      clear: makeProg(gl, VS, CLEAR_FS),
+      splat: makeProg(gl, VS, SPLAT_FS),
+      advection: makeProg(gl, VS, ADVECT_FS),
+      divergence: makeProg(gl, VS, DIVERGENCE_FS),
+      curl: makeProg(gl, VS, CURL_FS),
+      vorticity: makeProg(gl, VS, VORTICITY_FS),
+      pressure: makeProg(gl, VS, PRESSURE_FS),
+      gradient: makeProg(gl, VS, GRADIENT_FS),
+      display: makeProg(gl, VS, DISPLAY_FS),
+    };
+
+    // --- create FBOs ---
+    const simRes = getRes(gl, SIM_RES);
+    const dyeRes = getRes(gl, DYE_RES);
+    const halfFloat = gl.HALF_FLOAT;
+    const rgba16f = gl.RGBA16F;
+    const rgba = gl.RGBA;
+    const linear = gl.LINEAR;
+
+    const velocity = makeDoubleFBO(gl, simRes.w, simRes.h, rgba16f, rgba, halfFloat, linear);
+    const dye = makeDoubleFBO(gl, dyeRes.w, dyeRes.h, rgba16f, rgba, halfFloat, linear);
+    const pressure = makeDoubleFBO(gl, simRes.w, simRes.h, rgba16f, rgba, halfFloat, linear);
+    const divergenceFBO = makeFBO(gl, simRes.w, simRes.h, rgba16f, rgba, halfFloat, linear);
+    const curlFBO = makeFBO(gl, simRes.w, simRes.h, rgba16f, rgba, halfFloat, linear);
+
+    // --- blit helper ---
+    function blit(target: FBO | null) {
+      if (target) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+        gl.viewport(0, 0, target.width, target.height);
+      } else {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, canvas.width, canvas.height);
+      }
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
 
-    valsRef.current = next;
-    // throttle React state so sliders don't thrash at MIDI rate
-    if (!midiThrottle.current) {
-      midiThrottle.current = setTimeout(() => {
-        setVals([...valsRef.current]);
-        midiThrottle.current = null;
-      }, 100);
-    }
-  }, [message]);
+    // --- pointer state ---
+    let prevX = 0, prevY = 0;
+    let splatQueue: { x: number; y: number; dx: number; dy: number; color: { r: number; g: number; b: number } }[] = [];
+    let hue = Math.random() * 360;
 
-  // --- disturber effects ---
-  const handleDisturbances = useCallback((disturbances: Disturbance[]) => {
-    const next = [...valsRef.current];
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext("2d");
+    // --- disturber: cursor idleness → monochrome ---
+    let lastCursorMove = performance.now();
+    let saturation = 1.0;       // current (lerped)
+    let targetSaturation = 1.0; // 1 = full color, 0 = grayscale
+    const IDLE_AFTER_MS = 3000;
+    const MOVE_DEADZONE = 0.008; // UV units — ignores tiny jitter (~8px on 1080p)
 
-    for (const d of disturbances) {
-      switch (d.action) {
-        case "add_chaos":
-          next[2] = Math.random(); // scale
-          next[5] = Math.random(); // rotation
-          next[6] = Math.random(); // skewX
-          next[7] = Math.random(); // skewY
-          next[8] = Math.random(); // shape
-          break;
+    function updatePointer(clientX: number, clientY: number) {
+      const rect = canvas.getBoundingClientRect();
+      const x = (clientX - rect.left) / rect.width;
+      const y = 1.0 - (clientY - rect.top) / rect.height;
+      const dx = (clientX - prevX) / rect.width;
+      const dy = -(clientY - prevY) / rect.height;
+      prevX = clientX;
+      prevY = clientY;
 
-        case "change_palette": {
-          next[9] = Math.random();
-          const p = d.paletteType as string;
-          if (p === "grayscale" || p === "monochrome") {
-            next[10] = 0;
-          } else if (p === "neon") {
-            next[10] = 1; next[11] = 0.7;
-          } else if (p === "pastel") {
-            next[10] = 0.3; next[11] = 0.8;
-          } else {
-            next[10] = Math.random(); next[11] = Math.random();
-          }
-          break;
-        }
+      hue = (hue + 3) % 360;
+      const color = hslToRgb(hue, 1, 0.5);
+      splatQueue.push({ x, y, dx: dx * SPLAT_FORCE, dy: dy * SPLAT_FORCE, color });
 
-        case "increase_saturation":
-          next[10] = Math.min(1, next[10] * ((d.amount as number) ?? 1.5));
-          break;
-
-        case "invert_colors":
-          next[11] = 1 - next[11];
-          break;
-
-        case "glitch":
-        case "distort_canvas":
-          for (let i = 3; i <= 8; i++) next[i] = Math.random();
-          break;
-
-        case "clear_partial": {
-          if (!ctx || !canvas) break;
-          const pct = ((d.erasurePercent as number) ?? 50) / 100;
-          ctx.save();
-          ctx.fillStyle = "black";
-          if (d.pattern === "center") {
-            const w = canvas.width * Math.sqrt(pct);
-            const h = canvas.height * Math.sqrt(pct);
-            ctx.fillRect((canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
-          } else if (d.pattern === "edges") {
-            const t = Math.min(canvas.width, canvas.height) * pct * 0.5;
-            ctx.fillRect(0, 0, canvas.width, t);
-            ctx.fillRect(0, canvas.height - t, canvas.width, t);
-            ctx.fillRect(0, 0, t, canvas.height);
-            ctx.fillRect(canvas.width - t, 0, t, canvas.height);
-          } else {
-            for (let i = 0; i < Math.floor(pct * 20); i++) {
-              ctx.fillRect(
-                Math.random() * canvas.width, Math.random() * canvas.height,
-                canvas.width * 0.15, canvas.height * 0.15
-              );
-            }
-          }
-          ctx.restore();
-          break;
-        }
+      // only count as real movement if above dead zone
+      if (Math.abs(dx) > MOVE_DEADZONE || Math.abs(dy) > MOVE_DEADZONE) {
+        lastCursorMove = performance.now();
+        targetSaturation = 1.0;
       }
     }
-    valsRef.current = next;
-    setVals(next);
-  }, []);
 
-  useDisturber(message, handleDisturbances);
+    canvas.addEventListener("mousemove", (e) => updatePointer(e.clientX, e.clientY));
+    canvas.addEventListener("touchmove", (e) => {
+      e.preventDefault();
+      updatePointer(e.touches[0].clientX, e.touches[0].clientY);
+    }, { passive: false });
+    canvas.addEventListener("touchstart", (e) => {
+      e.preventDefault();
+      const t = e.touches[0];
+      prevX = t.clientX;
+      prevY = t.clientY;
+    }, { passive: false });
 
-  // --- IMU physics ---
-  const feedAccel = useCallback((ax: number, ay: number) => {
-    const now = performance.now();
-    const dt  = lastMotionT.current
-      ? Math.min((now - lastMotionT.current) / 1000, 0.05)
-      : 0.016;
-    lastMotionT.current = now;
+    // --- splat function ---
+    function doSplat(x: number, y: number, dx: number, dy: number, color: { r: number; g: number; b: number }) {
+      const p = progs.splat;
+      const aspect = canvas.width / canvas.height;
 
-    const SENSITIVITY = 0.003;
-    const DAMPING = Math.pow(0.88, dt * 60);
+      // velocity splat
+      p.bind();
+      gl.uniform1i(p.uniforms.uTex, velocity.read.attach(0));
+      gl.uniform1f(p.uniforms.uAspect, aspect);
+      gl.uniform2f(p.uniforms.uPoint, x, y);
+      gl.uniform3f(p.uniforms.uColor, dx, dy, 0);
+      gl.uniform1f(p.uniforms.uRadius, SPLAT_RADIUS);
+      blit(velocity.write);
+      velocity.swap();
 
-    const imu = imuRef.current;
-    imu.vx += ax * SENSITIVITY * dt * 60;
-    imu.vy -= ay * SENSITIVITY * dt * 60;
-    imu.vx *= DAMPING;
-    imu.vy *= DAMPING;
-    imu.x += imu.vx;
-    imu.y += imu.vy;
+      // dye splat
+      gl.uniform1i(p.uniforms.uTex, dye.read.attach(0));
+      gl.uniform3f(p.uniforms.uColor, color.r * 0.3, color.g * 0.3, color.b * 0.3);
+      blit(dye.write);
+      dye.swap();
+    }
 
-    if (imu.x < 0) { imu.x = 0; imu.vx *= -0.4; }
-    if (imu.x > 1) { imu.x = 1; imu.vx *= -0.4; }
-    if (imu.y < 0) { imu.y = 0; imu.vy *= -0.4; }
-    if (imu.y > 1) { imu.y = 1; imu.vy *= -0.4; }
-  }, []);
+    // --- random initial splats ---
+    function randomSplats(n: number) {
+      for (let i = 0; i < n; i++) {
+        const c = hslToRgb(Math.random() * 360, 1, 0.5);
+        doSplat(
+          Math.random(), Math.random(),
+          (Math.random() - 0.5) * 1000, (Math.random() - 0.5) * 1000,
+          c
+        );
+      }
+    }
 
-  // stable rAF loop ref
-  const loopRef = useRef<() => void>(() => {});
-  useEffect(() => {
-    loopRef.current = () => {
-      if (!imuActive.current) return;
-      const canvas = canvasRef.current;
-      const ctx    = canvas?.getContext("2d");
-      if (!canvas || !ctx) return;
-      initCanvas();
-      const { x, y } = imuRef.current;
-      const v = valsRef.current;
-      drawSplat(ctx, canvas.width, canvas.height,
-        x, y, v[2], v[3], v[4], v[5], v[6], v[7], v[8],
-        v[9], v[10], v[11], v[12], v[13], v[14], v[15], v[16]
-      );
-      rafRef.current = requestAnimationFrame(loopRef.current);
+    randomSplats(Math.floor(Math.random() * 5) + 5);
+
+    // --- simulation step ---
+    function step(dt: number) {
+      const tx = velocity.texelX;
+      const ty = velocity.texelY;
+
+      // 1. Curl
+      progs.curl.bind();
+      gl.uniform2f(progs.curl.uniforms.uTexel, tx, ty);
+      gl.uniform1i(progs.curl.uniforms.uVel, velocity.read.attach(0));
+      blit(curlFBO);
+
+      // 2. Vorticity confinement
+      progs.vorticity.bind();
+      gl.uniform2f(progs.vorticity.uniforms.uTexel, tx, ty);
+      gl.uniform1i(progs.vorticity.uniforms.uVel, velocity.read.attach(0));
+      gl.uniform1i(progs.vorticity.uniforms.uCurl, curlFBO.attach(1));
+      gl.uniform1f(progs.vorticity.uniforms.uCurlStr, CURL_STRENGTH);
+      gl.uniform1f(progs.vorticity.uniforms.uDt, dt);
+      blit(velocity.write);
+      velocity.swap();
+
+      // 3. Advect velocity
+      progs.advection.bind();
+      gl.uniform2f(progs.advection.uniforms.uTexel, tx, ty);
+      gl.uniform1i(progs.advection.uniforms.uVel, velocity.read.attach(0));
+      gl.uniform1i(progs.advection.uniforms.uSource, velocity.read.attach(0));
+      gl.uniform1f(progs.advection.uniforms.uDt, dt);
+      gl.uniform1f(progs.advection.uniforms.uDiss, 1.0 / (1.0 + dt * VEL_DISSIPATION));
+      blit(velocity.write);
+      velocity.swap();
+
+      // 4. Advect dye
+      gl.uniform1i(progs.advection.uniforms.uVel, velocity.read.attach(0));
+      gl.uniform1i(progs.advection.uniforms.uSource, dye.read.attach(1));
+      gl.uniform1f(progs.advection.uniforms.uDiss, 1.0 / (1.0 + dt * DYE_DISSIPATION));
+      blit(dye.write);
+      dye.swap();
+
+      // 5. Divergence
+      progs.divergence.bind();
+      gl.uniform2f(progs.divergence.uniforms.uTexel, tx, ty);
+      gl.uniform1i(progs.divergence.uniforms.uVel, velocity.read.attach(0));
+      blit(divergenceFBO);
+
+      // 6. Clear/dissipate pressure
+      progs.clear.bind();
+      gl.uniform1i(progs.clear.uniforms.uTex, pressure.read.attach(0));
+      gl.uniform1f(progs.clear.uniforms.uValue, PRESSURE_DISSIPATION);
+      blit(pressure.write);
+      pressure.swap();
+
+      // 7. Pressure solve (Jacobi)
+      progs.pressure.bind();
+      gl.uniform2f(progs.pressure.uniforms.uTexel, tx, ty);
+      gl.uniform1i(progs.pressure.uniforms.uDiv, divergenceFBO.attach(1));
+      for (let i = 0; i < PRESSURE_ITERS; i++) {
+        gl.uniform1i(progs.pressure.uniforms.uPres, pressure.read.attach(0));
+        blit(pressure.write);
+        pressure.swap();
+      }
+
+      // 8. Gradient subtract
+      progs.gradient.bind();
+      gl.uniform2f(progs.gradient.uniforms.uTexel, tx, ty);
+      gl.uniform1i(progs.gradient.uniforms.uPres, pressure.read.attach(0));
+      gl.uniform1i(progs.gradient.uniforms.uVel, velocity.read.attach(1));
+      blit(velocity.write);
+      velocity.swap();
+    }
+
+    // --- animation loop ---
+    let lastTime = performance.now();
+    let lastLog = performance.now();
+    let animId: number;
+
+    function loop() {
+      const now = performance.now();
+      const dt = Math.min((now - lastTime) / 1000, 1 / 60);
+      lastTime = now;
+
+      // process queued splats
+      for (const s of splatQueue) {
+        doSplat(s.x, s.y, s.dx, s.dy, s.color);
+      }
+      splatQueue = [];
+
+      // idle for IDLE_AFTER_MS → go monochrome
+      if (now - lastCursorMove >= IDLE_AFTER_MS) {
+        targetSaturation = 0.0;
+      }
+
+      // log every 2s
+      if (now - lastLog >= 2000) {
+        lastLog = now;
+        const idleSec = ((now - lastCursorMove) / 1000).toFixed(1);
+        console.log(`[disturber] idle=${idleSec}s  saturation=${saturation.toFixed(3)}  target=${targetSaturation}`);
+      }
+
+      // drain to gray (~3s), fast restore on movement (~0.3s)
+      const lerpSpeed = targetSaturation < saturation ? 0.8 : 6.0;
+      saturation += (targetSaturation - saturation) * Math.min(dt * lerpSpeed, 1);
+
+      step(dt);
+
+      // display
+      progs.display.bind();
+      gl.uniform1i(progs.display.uniforms.uTex, dye.read.attach(0));
+      gl.uniform1f(progs.display.uniforms.uSaturation, saturation);
+      blit(null);
+
+      animId = requestAnimationFrame(loop);
+    }
+
+    loop();
+
+    // --- resize ---
+    function onResize() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    window.addEventListener("resize", onResize);
+
+    return () => {
+      cancelAnimationFrame(animId);
+      window.removeEventListener("resize", onResize);
     };
-  });
-
-  const startImu = useCallback(() => {
-    imuRef.current      = { x: 0.5, y: 0.5, vx: 0, vy: 0 };
-    lastMotionT.current = null;
-    imuActive.current   = true;
-    rafRef.current = requestAnimationFrame(loopRef.current);
-    displayTimer.current = setInterval(() => {
-      const { x, y } = imuRef.current;
-      setImuDisplay({ x, y });
-    }, 80);
-    setImuEnabled(true);
   }, []);
-
-  const stopImu = useCallback(() => {
-    imuActive.current = false;
-    if (rafRef.current)       cancelAnimationFrame(rafRef.current);
-    if (displayTimer.current) clearInterval(displayTimer.current);
-    setImuEnabled(false);
-  }, []);
-
-  useEffect(() => stopImu, [stopImu]);
-
-  // --- manual draw ---
-  const initAndDraw = (v: number[]) => {
-    const canvas = canvasRef.current;
-    const ctx    = canvas?.getContext("2d");
-    if (!canvas || !ctx) return;
-    initCanvas();
-    const [v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15,v16,v17] = v;
-    drawSplat(ctx, canvas.width, canvas.height,
-      v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15,v16,v17);
-  };
-
-  const handleDraw       = () => initAndDraw(vals);
-  const handleRandomize  = () => setVals(randomValues());
-  const handleRandomDraw = () => { const n = randomValues(); setVals(n); initAndDraw(n); };
-
-  // expose feedAccel for external transport to call
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (globalThis as any).__feedAccel = feedAccel;
-
-  const labels = [
-    "x","y","scale","aspect x","aspect y","rotation",
-    "skew x","skew y","shape (n)","hue","saturation",
-    "lightness","opacity","hue 2","color stop","inner radius","falloff",
-  ];
 
   return (
-    <>
-      <canvas ref={canvasRef} className="block" />
-
-      {/* open/close button */}
-      <button
-        onClick={() => setOpen(o => !o)}
-        className="fixed bottom-6 right-6 z-50 h-12 w-12 rounded-full bg-white/10 backdrop-blur border border-white/20 text-white text-xl flex items-center justify-center hover:bg-white/20 transition-colors"
-      >
-        {open ? "×" : "+"}
-      </button>
-
-      {/* popup */}
-      {open && (
-        <div className="fixed bottom-22 right-6 z-50 w-80 rounded-2xl bg-zinc-900/90 backdrop-blur border border-white/10 p-5 flex flex-col gap-4 text-white shadow-2xl">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <p className="text-sm font-medium text-zinc-300 tracking-wide">Splat Generator</p>
-              {/* MIDI connection indicator */}
-              <span
-                title={connected ? "MIDI connected" : "MIDI disconnected"}
-                className={`h-1.5 w-1.5 rounded-full ${connected ? "bg-emerald-400" : "bg-zinc-600"}`}
-              />
-            </div>
-
-            {/* IMU toggle */}
-            <button
-              onClick={imuEnabled ? stopImu : startImu}
-              className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-colors ${
-                imuEnabled
-                  ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
-                  : "bg-white/5 text-zinc-400 border border-white/10 hover:bg-white/10"
-              }`}
-            >
-              <span className={`h-1.5 w-1.5 rounded-full ${imuEnabled ? "bg-emerald-400 animate-pulse" : "bg-zinc-500"}`} />
-              IMU
-            </button>
-          </div>
-
-          <div className="flex flex-col gap-2 max-h-72 overflow-y-auto pr-1">
-            {vals.map((v, i) => {
-              const isImuControlled = imuEnabled && i < 2;
-              const displayVal = isImuControlled
-                ? (i === 0 ? imuDisplay.x : imuDisplay.y)
-                : v;
-              return (
-                <div key={i} className="flex items-center gap-3">
-                  <span className={`w-24 text-xs shrink-0 ${isImuControlled ? "text-emerald-400" : "text-zinc-400"}`}>
-                    {labels[i]}
-                  </span>
-                  <input
-                    type="range"
-                    min={0} max={1} step={0.001}
-                    value={displayVal}
-                    disabled={isImuControlled}
-                    onChange={e => {
-                      if (isImuControlled) return;
-                      const next = [...vals];
-                      next[i] = parseFloat(e.target.value);
-                      setVals(next);
-                    }}
-                    className={`flex-1 h-1 ${isImuControlled ? "accent-emerald-400 opacity-60" : "accent-white"}`}
-                  />
-                  <span className="w-8 text-right text-xs text-zinc-500">
-                    {displayVal.toFixed(2)}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-
-          {!imuEnabled && (
-            <>
-              <div className="flex gap-2 pt-1">
-                <button
-                  onClick={handleRandomize}
-                  className="flex-1 rounded-lg border border-white/15 py-2 text-xs text-zinc-300 hover:bg-white/10 transition-colors"
-                >
-                  Randomize
-                </button>
-                <button
-                  onClick={handleDraw}
-                  className="flex-1 rounded-lg bg-white py-2 text-xs text-black font-medium hover:bg-zinc-200 transition-colors"
-                >
-                  Draw
-                </button>
-              </div>
-              <button
-                onClick={handleRandomDraw}
-                className="rounded-lg border border-white/15 py-2 text-xs text-zinc-300 hover:bg-white/10 transition-colors"
-              >
-                Random + Draw
-              </button>
-            </>
-          )}
-
-          {imuEnabled && (
-            <p className="text-center text-xs text-zinc-500">
-              Tilt device to paint · splats draw continuously
-            </p>
-          )}
-        </div>
-      )}
-    </>
+    <canvas
+      ref={canvasRef}
+      className="block w-screen h-screen"
+      style={{ cursor: "crosshair" }}
+    />
   );
 }
