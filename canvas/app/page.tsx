@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
+import { useMidi } from "./hooks/useMidi";
+import { useDisturber, type Disturbance } from "./hooks/useDisturber";
 
 function drawSplat(
   ctx: CanvasRenderingContext2D,
@@ -65,25 +67,29 @@ function randomValues(): number[] {
 type ImuState = { x: number; y: number; vx: number; vy: number };
 
 export default function Home() {
-  const canvasRef    = useRef<HTMLCanvasElement>(null);
-  const initialized  = useRef(false);
-  const [open, setOpen] = useState(false);
-  const [vals, setVals]  = useState<number[]>(randomValues());
-  const valsRef      = useRef(vals);
+  const canvasRef   = useRef<HTMLCanvasElement>(null);
+  const initialized = useRef(false);
+  const [open, setOpen]       = useState(false);
+  const [vals, setVals]       = useState<number[]>(randomValues());
+  const valsRef               = useRef(vals);
 
   // IMU
-  const imuRef       = useRef<ImuState>({ x: 0.5, y: 0.5, vx: 0, vy: 0 });
-  const imuActive    = useRef(false);
+  const imuRef        = useRef<ImuState>({ x: 0.5, y: 0.5, vx: 0, vy: 0 });
+  const imuActive     = useRef(false);
   const [imuEnabled, setImuEnabled] = useState(false);
   const [imuDisplay, setImuDisplay] = useState({ x: 0.5, y: 0.5 });
-  const rafRef       = useRef<number | null>(null);
-  const lastMotionT  = useRef<number | null>(null);
-  const displayTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const rafRef        = useRef<number | null>(null);
+  const lastMotionT   = useRef<number | null>(null);
+  const displayTimer  = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // keep valsRef in sync without triggering physics
+  // MIDI
+  const { message, connected } = useMidi();
+  const midiThrottle = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // keep valsRef in sync with slider state
   useEffect(() => { valsRef.current = vals; }, [vals]);
 
-  // canvas resize
+  // --- canvas resize ---
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -109,8 +115,112 @@ export default function Home() {
     initialized.current = true;
   }, []);
 
+  // --- MIDI → vals ---
+  useEffect(() => {
+    if (!message) return;
+    const next = [...valsRef.current];
+
+    if (message.type === "control_change") {
+      // CC 0–16 map directly to v1–v17
+      next[message.control % 17] = message.value / 127;
+    } else if (message.type === "pitchwheel") {
+      // –8192..8191 → 0..1 → rotation (v6)
+      next[5] = (message.pitch + 8192) / 16383;
+    } else if (message.type === "aftertouch") {
+      next[12] = message.value / 127; // opacity
+    } else if (message.type === "note_on") {
+      next[2] = message.velocity / 127; // scale
+    }
+
+    valsRef.current = next;
+    // throttle React state so sliders don't thrash at MIDI rate
+    if (!midiThrottle.current) {
+      midiThrottle.current = setTimeout(() => {
+        setVals([...valsRef.current]);
+        midiThrottle.current = null;
+      }, 100);
+    }
+  }, [message]);
+
+  // --- disturber effects ---
+  const handleDisturbances = useCallback((disturbances: Disturbance[]) => {
+    const next = [...valsRef.current];
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext("2d");
+
+    for (const d of disturbances) {
+      switch (d.action) {
+        case "add_chaos":
+          next[2] = Math.random(); // scale
+          next[5] = Math.random(); // rotation
+          next[6] = Math.random(); // skewX
+          next[7] = Math.random(); // skewY
+          next[8] = Math.random(); // shape
+          break;
+
+        case "change_palette": {
+          next[9] = Math.random();
+          const p = d.paletteType as string;
+          if (p === "grayscale" || p === "monochrome") {
+            next[10] = 0;
+          } else if (p === "neon") {
+            next[10] = 1; next[11] = 0.7;
+          } else if (p === "pastel") {
+            next[10] = 0.3; next[11] = 0.8;
+          } else {
+            next[10] = Math.random(); next[11] = Math.random();
+          }
+          break;
+        }
+
+        case "increase_saturation":
+          next[10] = Math.min(1, next[10] * ((d.amount as number) ?? 1.5));
+          break;
+
+        case "invert_colors":
+          next[11] = 1 - next[11];
+          break;
+
+        case "glitch":
+        case "distort_canvas":
+          for (let i = 3; i <= 8; i++) next[i] = Math.random();
+          break;
+
+        case "clear_partial": {
+          if (!ctx || !canvas) break;
+          const pct = ((d.erasurePercent as number) ?? 50) / 100;
+          ctx.save();
+          ctx.fillStyle = "black";
+          if (d.pattern === "center") {
+            const w = canvas.width * Math.sqrt(pct);
+            const h = canvas.height * Math.sqrt(pct);
+            ctx.fillRect((canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
+          } else if (d.pattern === "edges") {
+            const t = Math.min(canvas.width, canvas.height) * pct * 0.5;
+            ctx.fillRect(0, 0, canvas.width, t);
+            ctx.fillRect(0, canvas.height - t, canvas.width, t);
+            ctx.fillRect(0, 0, t, canvas.height);
+            ctx.fillRect(canvas.width - t, 0, t, canvas.height);
+          } else {
+            for (let i = 0; i < Math.floor(pct * 20); i++) {
+              ctx.fillRect(
+                Math.random() * canvas.width, Math.random() * canvas.height,
+                canvas.width * 0.15, canvas.height * 0.15
+              );
+            }
+          }
+          ctx.restore();
+          break;
+        }
+      }
+    }
+    valsRef.current = next;
+    setVals(next);
+  }, []);
+
+  useDisturber(message, handleDisturbances);
+
   // --- IMU physics ---
-  // Call this with raw acceleration values (m/s²) from any source
   const feedAccel = useCallback((ax: number, ay: number) => {
     const now = performance.now();
     const dt  = lastMotionT.current
@@ -124,21 +234,18 @@ export default function Home() {
     const imu = imuRef.current;
     imu.vx += ax * SENSITIVITY * dt * 60;
     imu.vy -= ay * SENSITIVITY * dt * 60;
-
     imu.vx *= DAMPING;
     imu.vy *= DAMPING;
-
     imu.x += imu.vx;
     imu.y += imu.vy;
 
-    if (imu.x < 0) { imu.x = 0;  imu.vx *= -0.4; }
-    if (imu.x > 1) { imu.x = 1;  imu.vx *= -0.4; }
-    if (imu.y < 0) { imu.y = 0;  imu.vy *= -0.4; }
-    if (imu.y > 1) { imu.y = 1;  imu.vy *= -0.4; }
+    if (imu.x < 0) { imu.x = 0; imu.vx *= -0.4; }
+    if (imu.x > 1) { imu.x = 1; imu.vx *= -0.4; }
+    if (imu.y < 0) { imu.y = 0; imu.vy *= -0.4; }
+    if (imu.y > 1) { imu.y = 1; imu.vy *= -0.4; }
   }, []);
 
-  // --- rAF draw loop (IMU mode) ---
-  // stored in ref so the loop can re-schedule itself stably
+  // stable rAF loop ref
   const loopRef = useRef<() => void>(() => {});
   useEffect(() => {
     loopRef.current = () => {
@@ -161,14 +268,11 @@ export default function Home() {
     imuRef.current      = { x: 0.5, y: 0.5, vx: 0, vy: 0 };
     lastMotionT.current = null;
     imuActive.current   = true;
-
     rafRef.current = requestAnimationFrame(loopRef.current);
-
     displayTimer.current = setInterval(() => {
       const { x, y } = imuRef.current;
       setImuDisplay({ x, y });
     }, 80);
-
     setImuEnabled(true);
   }, []);
 
@@ -196,6 +300,10 @@ export default function Home() {
   const handleRandomize  = () => setVals(randomValues());
   const handleRandomDraw = () => { const n = randomValues(); setVals(n); initAndDraw(n); };
 
+  // expose feedAccel for external transport to call
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (globalThis as any).__feedAccel = feedAccel;
+
   const labels = [
     "x","y","scale","aspect x","aspect y","rotation",
     "skew x","skew y","shape (n)","hue","saturation",
@@ -218,7 +326,14 @@ export default function Home() {
       {open && (
         <div className="fixed bottom-22 right-6 z-50 w-80 rounded-2xl bg-zinc-900/90 backdrop-blur border border-white/10 p-5 flex flex-col gap-4 text-white shadow-2xl">
           <div className="flex items-center justify-between">
-            <p className="text-sm font-medium text-zinc-300 tracking-wide">Splat Generator</p>
+            <div className="flex items-center gap-2">
+              <p className="text-sm font-medium text-zinc-300 tracking-wide">Splat Generator</p>
+              {/* MIDI connection indicator */}
+              <span
+                title={connected ? "MIDI connected" : "MIDI disconnected"}
+                className={`h-1.5 w-1.5 rounded-full ${connected ? "bg-emerald-400" : "bg-zinc-600"}`}
+              />
+            </div>
 
             {/* IMU toggle */}
             <button
@@ -266,7 +381,6 @@ export default function Home() {
             })}
           </div>
 
-          {/* manual controls — hidden while IMU is running */}
           {!imuEnabled && (
             <>
               <div className="flex gap-2 pt-1">
