@@ -4,17 +4,11 @@ import { z } from "zod";
 
 const anthropic = createAnthropic();
 
-const DisturbanceSchema = z.discriminatedUnion("action", [
-  z.object({ action: z.literal("none") }),
-  z.object({
-    action: z.literal("add_splats"),
-    count: z.number().int().min(1).max(8),
-  }),
-  z.object({
-    action: z.literal("set_saturation"),
-    value: z.number().min(0).max(1),
-  }),
-]);
+const DisturbanceSchema = z.object({
+  action: z.enum(["none", "add_splats", "set_saturation"]),
+  count: z.number().int().optional().describe("Required when action=add_splats. Integer 1–8."),
+  value: z.number().optional().describe("Required when action=set_saturation. Float 0.0 (gray) to 1.0 (full color)."),
+});
 
 const ResponseSchema = z.object({
   analysis: z.string().describe("1-2 sentences on what the user just did"),
@@ -80,7 +74,7 @@ What do you observe and how do you respond?`;
     return Response.json({
       analysis:        object.analysis,
       narrativeUpdate: object.narrativeUpdate,
-      disturbances:    object.disturbances.filter((d) => d.action !== "none"),
+      disturbances:    object.disturbances.filter((d) => d.action !== "none" && d.action !== undefined),
     });
   } catch (error) {
     console.error("Agent error:", error);
