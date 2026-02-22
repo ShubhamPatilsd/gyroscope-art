@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useRef } from "react";
+import { useMidi, OrbaState } from "./hooks/useMidi";
 
 // ======================== CONFIG ========================
 
@@ -368,6 +369,19 @@ export default function Home() {
   const narrativeRef       = useRef("");
   const pendingRef         = useRef(false);
 
+  // Orba MIDI
+  const { state: orbaState, connected: orbaConnected } = useMidi();
+  const prevOrbaRef        = useRef<OrbaState | null>(null);
+  const orbaHitsRef        = useRef(0);       // note hits in last 2s (for disturber)
+  const orbaConnectedRef   = useRef(false);
+  const orbaHueDriftRef    = useRef(0);       // accumulated hue drift from rotational_velocity
+  // Bridging refs so Orba effect can call into the main effect's doSplat/particles
+  const doSplatRef         = useRef<(x: number, y: number, dx: number, dy: number, color: { r: number; g: number; b: number }) => void>(() => {});
+  const particlesRef       = useRef<Particle[]>([]);
+  const lastActivityRef    = useRef({ set: (_t: number) => {} }); // will be wired up
+  // keep ref in sync so the effect closure can read it
+  orbaConnectedRef.current = orbaConnected;
+
   useEffect(() => {
     const canvas = canvasRef.current!;
     canvas.width = window.innerWidth;
@@ -482,6 +496,7 @@ export default function Home() {
       const movement = paintMovement;
       paintCount    = 0;
       paintMovement = 0;
+      orbaHitsRef.current = 0;
 
       if (count === 0 && idleSec < 2) return; // nothing interesting yet
 
@@ -497,6 +512,8 @@ export default function Home() {
             currentSaturation: +saturation.toFixed(3),
             currentHue:        Math.round(hue),
             narrative:         narrativeRef.current,
+            orbaConnected:     orbaConnectedRef.current,
+            orbaActivity:      orbaHitsRef.current,
           }),
         });
         const data = await res.json();
@@ -544,6 +561,15 @@ export default function Home() {
       dye.swap();
     }
 
+    // --- expose doSplat to Orba effect ---
+    doSplatRef.current = doSplat;
+    lastActivityRef.current = {
+      set(t: number) {
+        lastCursorMove = t;
+        agentTargetSatRef.current = 1.0;
+      },
+    };
+
     // --- random initial splats ---
     function randomSplats(n: number) {
       for (let i = 0; i < n; i++) {
@@ -564,6 +590,7 @@ export default function Home() {
     pCanvas.height = window.innerHeight;
     const pCtx = pCanvas.getContext("2d")!;
     const particles: Particle[] = [];
+    particlesRef.current = particles;
 
     // --- keyboard → splats + particles ---
     const keyTimes: number[] = [];
@@ -705,6 +732,9 @@ export default function Home() {
         doSplat(s.x, s.y, s.dx, s.dy, s.color);
       }
 
+      // Orba rotational_velocity → hue drift
+      hue = (hue + orbaHueDriftRef.current * dt * 200) % 360;
+
       // lerp saturation toward agent's target
       const target = agentTargetSatRef.current;
       const lerpSpeed = target < saturation ? 0.8 : 6.0;
@@ -746,6 +776,65 @@ export default function Home() {
       window.removeEventListener("touchstart", onTouchStart);
     };
   }, []);
+
+  // --- Orba state → fluid sim ---
+  useEffect(() => {
+    if (!orbaState) return;
+    const prev = prevOrbaRef.current;
+    prevOrbaRef.current = { ...orbaState };
+
+    const doSplat = doSplatRef.current;
+    const particles = particlesRef.current;
+
+    // Always update hue drift from rotational_velocity
+    orbaHueDriftRef.current = orbaState.rotational_velocity;
+
+    // Mark Orba as activity
+    lastActivityRef.current.set(performance.now());
+
+    // Detect note_on: note changed and force > 0
+    const noteOn = prev && (orbaState.note !== prev.note || orbaState.force !== prev.force) && orbaState.force > 0;
+
+    if (noteOn) {
+      orbaHitsRef.current++;
+      const x = orbaState.gyroscope;
+      const y = orbaState.swell;
+      const forceMul = orbaState.force;
+      const angle = Math.random() * Math.PI * 2;
+      const splatForce = forceMul * SPLAT_FORCE;
+      const hue = Math.random() * 360;
+      const color = hslToRgb(hue, 1, 0.5);
+
+      doSplat(x, y, Math.cos(angle) * splatForce, Math.sin(angle) * splatForce, color);
+
+      // Particle burst scaled by force
+      const count = Math.floor(8 + forceMul * 30);
+      const speed = 0.05 + forceMul * 0.2;
+      spawnBurst(particles, x, y, count, speed, hue);
+    }
+
+    // Accelerometer spike → particle burst
+    if (prev && orbaState.accelerometer > 0.3 && orbaState.accelerometer > prev.accelerometer + 0.1) {
+      const x = orbaState.gyroscope;
+      const y = orbaState.swell;
+      const hue = Math.random() * 360;
+      const count = Math.floor(10 + orbaState.accelerometer * 25);
+      spawnBurst(particles, x, y, count, 0.15, hue);
+    }
+
+    // Contact toggle on → big radial burst
+    if (prev && orbaState.contact && !prev.contact) {
+      const cx = 0.5;
+      const cy = 0.5;
+      for (let i = 0; i < 8; i++) {
+        const angle = (i / 8) * Math.PI * 2;
+        const hue = (i / 8) * 360;
+        const color = hslToRgb(hue, 1, 0.5);
+        doSplat(cx, cy, Math.cos(angle) * 3000, Math.sin(angle) * 3000, color);
+      }
+      spawnBurst(particles, cx, cy, 60, 0.25, Math.random() * 360);
+    }
+  }, [orbaState]);
 
   return (
     <>

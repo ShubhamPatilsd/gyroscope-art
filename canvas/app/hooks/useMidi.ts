@@ -1,15 +1,19 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 
-export type MidiMessage =
-  | { type: "note_on"; pitch: number; velocity: number }
-  | { type: "note_off"; pitch: number; velocity: number }
-  | { type: "pitchwheel"; pitch: number }
-  | { type: "aftertouch"; value: number }
-  | { type: "control_change"; control: number; value: number };
+export type OrbaState = {
+  channel: string;            // "drums" | "bass" | "chord" | "treble"
+  note: number;               // 0–1
+  force: number;              // 0–1
+  swell: number;              // 0–1
+  rotational_velocity: number; // 0–1
+  gyroscope: number;          // 0–1
+  accelerometer: number;      // 0–1
+  contact: boolean;
+};
 
 export function useMidi(url = "ws://localhost:8765") {
-  const [message, setMessage] = useState<MidiMessage | null>(null);
+  const [state, setState] = useState<OrbaState | null>(null);
   const [connected, setConnected] = useState(false);
   const ws = useRef<WebSocket | null>(null);
   const retryTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -26,7 +30,7 @@ export function useMidi(url = "ws://localhost:8765") {
 
       socket.onmessage = (e) => {
         try {
-          setMessage(JSON.parse(e.data) as MidiMessage);
+          setState(JSON.parse(e.data) as OrbaState);
         } catch {
           // ignore malformed messages
         }
@@ -47,5 +51,5 @@ export function useMidi(url = "ws://localhost:8765") {
     };
   }, [url]);
 
-  return { message, connected };
+  return { state, connected };
 }

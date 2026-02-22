@@ -24,31 +24,34 @@ const ResponseSchema = z.object({
 
 const SYSTEM = `You are a generative art agent co-piloting a WebGL fluid simulation with a user.
 
-The user paints colorful fluid by moving their cursor. Splats inject dye + velocity into a Navier-Stokes fluid sim.
+The user interacts via cursor movement, keyboard, or an Artiphon Orba — a round MIDI instrument with pads for drums/bass/chord/treble, tilt sensors (gyroscope, accelerometer), swell (breath-like pressure), and a contact sensor (table hit).
 
 Every 2 seconds you get a snapshot of what happened:
-- splatCount: how many paint strokes in that window
+- splatCount: how many paint strokes in that window (cursor + keyboard)
 - totalMovement: total cursor distance (UV units, 0–1 scale)
-- idleSec: seconds since last cursor movement
+- idleSec: seconds since last activity (cursor, keyboard, or Orba)
 - currentSaturation: 0=grayscale, 1=full color
 - currentHue: current paint hue in degrees
+- orbaConnected: whether the Orba MIDI instrument is connected
+- orbaActivity: number of Orba note hits in the last 2s
 
 Your two levers:
 1. add_splats (count 1–8): inject random fluid bursts anywhere on canvas
 2. set_saturation (0–1): shift the whole canvas toward gray or full color
 
 Guidelines:
-- If the user is actively painting, you can add complementary splats or do nothing.
+- If the user is actively painting or playing the Orba, you can add complementary splats or do nothing.
+- Orba activity (orbaActivity > 0) counts as user engagement — don't fade to gray while they play.
 - If idle > 5s, consider fading saturation toward gray (set_saturation 0–0.3) to invite them back.
 - If idle > 10s and already gray, inject a few splats to stir things up.
-- When user resumes painting, saturation auto-restores to 1.0 — you don't need to handle that.
+- When user resumes painting or playing, saturation auto-restores to 1.0 — you don't need to handle that.
 - Be subtle. 1–3 splats is usually enough. Don't spam.
 - Silence (empty disturbances) is valid and often best.
 - Keep narrativeUpdate under 400 chars total.`;
 
 export async function POST(request: Request) {
   try {
-    const { splatCount, totalMovement, idleSec, currentSaturation, currentHue, narrative } =
+    const { splatCount, totalMovement, idleSec, currentSaturation, currentHue, narrative, orbaConnected, orbaActivity } =
       (await request.json()) as {
         splatCount: number;
         totalMovement: number;
@@ -56,11 +59,17 @@ export async function POST(request: Request) {
         currentSaturation: number;
         currentHue: number;
         narrative: string;
+        orbaConnected: boolean;
+        orbaActivity: number;
       };
+
+    const orbaLine = orbaConnected
+      ? `Orba: connected, ${orbaActivity} note hits`
+      : "Orba: not connected";
 
     const prompt = `Session log: ${narrative || "(just started)"}
 
-Last 2s — strokes: ${splatCount}, movement: ${totalMovement}, idle: ${idleSec}s, saturation: ${currentSaturation}, hue: ${currentHue}°
+Last 2s — strokes: ${splatCount}, movement: ${totalMovement}, idle: ${idleSec}s, saturation: ${currentSaturation}, hue: ${currentHue}°, ${orbaLine}
 
 What do you observe and how do you respond?`;
 

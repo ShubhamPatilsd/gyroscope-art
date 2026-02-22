@@ -3,29 +3,93 @@ import json
 import mido
 import websockets
 
+# Channel number -> instrument name (from MODALITIES.md)
+CHANNEL_NAMES = {
+    9: "drums",
+    8: "bass",
+    15: "chord",
+    0: "treble",
+}
+
+# Contact sensor: channel 9, note 39 (table hit)
+CONTACT_CHANNEL = 9
+CONTACT_NOTE = 39
+
 clients: set = set()
 loop: asyncio.AbstractEventLoop | None = None
 
+# Current state; all continuous values normalized 0-1
+state = {
+    "channel": "drums",
+    "note": 0.0,
+    "force": 0.0,
+    "swell": 0.0,
+    "rotational_velocity": 0.0,
+    "gyroscope": 0.0,
+    "accelerometer": 0.0,
+    "contact": False,
+}
 
-def midi_callback(msg):
-    data: dict = {"type": msg.type}
 
-    if msg.type in ("note_on", "note_off"):
-        data["pitch"] = msg.note
-        data["velocity"] = msg.velocity
-    elif msg.type == "pitchwheel":
-        data["pitch"] = msg.pitch  # -8192 to 8191
-    elif msg.type == "aftertouch":
-        data["value"] = msg.value  # 0 to 127
-    elif msg.type == "control_change":
-        data["control"] = msg.control
-        data["value"] = msg.value
+def normalize_127(value: int) -> float:
+    """Map 0-127 to 0.0-1.0."""
+    return max(0.0, min(1.0, value / 127.0))
 
-    payload = json.dumps(data)
+
+def build_state_dict() -> dict:
+    return {
+        "channel": state["channel"],
+        "note": state["note"],
+        "force": state["force"],
+        "swell": state["swell"],
+        "rotational_velocity": state["rotational_velocity"],
+        "gyroscope": state["gyroscope"],
+        "accelerometer": state["accelerometer"],
+        "contact": state["contact"],
+    }
+
+
+def emit():
+    payload = json.dumps(build_state_dict())
     print(payload)
-
     if clients and loop:
         asyncio.run_coroutine_threadsafe(broadcast(payload), loop)
+
+
+def set_and_emit(key: str, value):
+    if state[key] != value:
+        state[key] = value
+        emit()
+
+
+def midi_callback(msg):
+    if msg.type == "control_change":
+        if msg.control == 112:
+            set_and_emit("rotational_velocity", normalize_127(msg.value))
+        elif msg.control == 1:
+            set_and_emit("gyroscope", normalize_127(msg.value))
+        elif msg.control == 74:
+            set_and_emit("swell", normalize_127(msg.value))
+        elif msg.control == 113:
+            set_and_emit("accelerometer", normalize_127(msg.value))
+
+    elif msg.type == "note_on":
+        if msg.channel == CONTACT_CHANNEL and msg.note == CONTACT_NOTE:
+            if not state["contact"]:
+                state["contact"] = True
+                emit()
+        else:
+            channel_name = CHANNEL_NAMES.get(msg.channel, state["channel"])
+            state["channel"] = channel_name
+            state["note"] = normalize_127(msg.note)
+            state["force"] = normalize_127(msg.velocity)
+            emit()
+
+    elif msg.type == "note_off":
+        if msg.channel == CONTACT_CHANNEL and msg.note == CONTACT_NOTE:
+            if state["contact"]:
+                state["contact"] = False
+                emit()
 
 
 async def broadcast(payload: str):

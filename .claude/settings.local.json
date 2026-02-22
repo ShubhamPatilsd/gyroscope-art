@@ -3,7 +3,9 @@
     "allow": [
       "Bash(cat:*)",
       "Bash(tail:*)",
-      "Bash(cd C:\\\\Users\\\\Clarissa\\\\Documents\\\\Code\\\\Hackathon\\\\gyroscope-art\\\\canvas:*)"
+      "Bash(cd C:\\\\Users\\\\Clarissa\\\\Documents\\\\Code\\\\Hackathon\\\\gyroscope-art\\\\canvas:*)",
+      "Bash(cd:*)",
+      "Bash(grep:*)"
     ]
   }
 }

@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useRef } from "react";
-import { MidiMessage } from "./useMidi";
+import { OrbaState } from "./useMidi";
 
 export interface Disturbance {
   action: string;
@@ -20,11 +20,11 @@ interface ValChange {
 }
 
 export function useDisturber(
-  message: MidiMessage | null,
+  message: OrbaState | null,
   vals: number[],
   onDisturbances: (disturbances: Disturbance[]) => void
 ) {
-  const eventsRef          = useRef<MidiMessage[]>([]);
+  const eventsRef          = useRef<OrbaState[]>([]);
   const prevValsRef        = useRef<number[]>([...vals]);
   const narrativeRef       = useRef<string>("");
   const valsRef            = useRef(vals);
