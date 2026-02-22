@@ -1,36 +1,91 @@
-// TODO: re-enable Orba MIDI disturbance when instrument is connected
-// import { generateText } from "ai";
-// import { createAnthropic } from "@ai-sdk/anthropic";
-// import { MidiMessage } from "@/app/hooks/useMidi";
-// import { analyzeMidi } from "@/lib/midi-analyzer";
-// import { disturberTools } from "@/lib/disturber-tools";
+import { generateObject } from "ai";
+import { createAnthropic } from "@ai-sdk/anthropic";
+import { z } from "zod";
 
-// Cursor movement threshold — total UV-space distance over the window.
-// Moving slowly across the full screen ≈ 0.3–0.5. Below 0.05 is basically idle.
-const IDLE_THRESHOLD = 0.05;
+const anthropic = createAnthropic();
+
+const DisturbanceSchema = z.discriminatedUnion("action", [
+  z.object({ action: z.literal("none") }),
+  z.object({
+    action: z.literal("add_splats"),
+    count: z.number().int().min(1).max(8),
+  }),
+  z.object({
+    action: z.literal("set_saturation"),
+    value: z.number().min(0).max(1),
+  }),
+]);
+
+const ResponseSchema = z.object({
+  analysis: z.string().describe("1-2 sentences on what the user just did"),
+  narrativeUpdate: z
+    .string()
+    .describe(
+      "Running session log, max 400 chars total. Append this moment; summarize older parts if needed."
+    ),
+  disturbances: z
+    .array(DisturbanceSchema)
+    .describe("0–2 actions. Empty or [{action:'none'}] = do nothing."),
+});
+
+const SYSTEM = `You are a generative art agent co-piloting a WebGL fluid simulation with a user.
+
+The user paints colorful fluid by moving their cursor. Splats inject dye + velocity into a Navier-Stokes fluid sim.
+
+Every 2 seconds you get a snapshot of what happened:
+- splatCount: how many paint strokes in that window
+- totalMovement: total cursor distance (UV units, 0–1 scale)
+- idleSec: seconds since last cursor movement
+- currentSaturation: 0=grayscale, 1=full color
+- currentHue: current paint hue in degrees
+
+Your two levers:
+1. add_splats (count 1–8): inject random fluid bursts anywhere on canvas
+2. set_saturation (0–1): shift the whole canvas toward gray or full color
+
+Guidelines:
+- If the user is actively painting, you can add complementary splats or do nothing.
+- If idle > 5s, consider fading saturation toward gray (set_saturation 0–0.3) to invite them back.
+- If idle > 10s and already gray, inject a few splats to stir things up.
+- When user resumes painting, saturation auto-restores to 1.0 — you don't need to handle that.
+- Be subtle. 1–3 splats is usually enough. Don't spam.
+- Silence (empty disturbances) is valid and often best.
+- Keep narrativeUpdate under 400 chars total.`;
 
 export async function POST(request: Request) {
   try {
-    const { cursorMovement, windowSeconds } = (await request.json()) as {
-      cursorMovement: number;
-      windowSeconds: number;
-    };
+    const { splatCount, totalMovement, idleSec, currentSaturation, currentHue, narrative } =
+      (await request.json()) as {
+        splatCount: number;
+        totalMovement: number;
+        idleSec: number;
+        currentSaturation: number;
+        currentHue: number;
+        narrative: string;
+      };
 
-    const isIdle = cursorMovement < IDLE_THRESHOLD;
+    const prompt = `Session log: ${narrative || "(just started)"}
 
-    if (!isIdle) {
-      return Response.json({ action: "none", cursorMovement, windowSeconds });
-    }
+Last 2s — strokes: ${splatCount}, movement: ${totalMovement}, idle: ${idleSec}s, saturation: ${currentSaturation}, hue: ${currentHue}°
+
+What do you observe and how do you respond?`;
+
+    const { object } = await generateObject({
+      model: anthropic("claude-haiku-4-5-20251001"),
+      schema: ResponseSchema,
+      system: SYSTEM,
+      prompt,
+    });
 
     return Response.json({
-      action: "disturb",
-      reason: `cursor barely moved (${cursorMovement.toFixed(4)} UV units in ${windowSeconds}s)`,
-      disturbances: [{ action: "change_palette", paletteType: "grayscale" }],
+      analysis:        object.analysis,
+      narrativeUpdate: object.narrativeUpdate,
+      disturbances:    object.disturbances.filter((d) => d.action !== "none"),
     });
   } catch (error) {
-    console.error("Disturber error:", error);
+    console.error("Agent error:", error);
     return Response.json(
-      { action: "error", error: error instanceof Error ? error.message : "Unknown error" },
+      { error: error instanceof Error ? error.message : "Unknown error" },
       { status: 500 }
     );
   }

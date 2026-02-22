@@ -292,8 +292,14 @@ function hslToRgb(h: number, s: number, l: number) {
 
 // ======================== COMPONENT ========================
 
+type Splat = { x: number; y: number; dx: number; dy: number; color: { r: number; g: number; b: number } };
+
 export default function Home() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const canvasRef          = useRef<HTMLCanvasElement>(null);
+  const agentSplatQueueRef = useRef<Splat[]>([]);
+  const agentTargetSatRef  = useRef(1.0);
+  const narrativeRef       = useRef("");
+  const pendingRef         = useRef(false);
 
   useEffect(() => {
     const canvas = canvasRef.current!;
@@ -357,12 +363,12 @@ export default function Home() {
     let splatQueue: { x: number; y: number; dx: number; dy: number; color: { r: number; g: number; b: number } }[] = [];
     let hue = Math.random() * 360;
 
-    // --- disturber: cursor idleness → monochrome ---
+    // --- cursor / paint tracking ---
     let lastCursorMove = performance.now();
-    let saturation = 1.0;       // current (lerped)
-    let targetSaturation = 1.0; // 1 = full color, 0 = grayscale
-    const IDLE_AFTER_MS = 3000;
+    let saturation = 1.0; // current (lerped toward agentTargetSatRef)
     const MOVE_DEADZONE = 0.008; // UV units — ignores tiny jitter (~8px on 1080p)
+    let paintCount    = 0;
+    let paintMovement = 0;
 
     function updatePointer(clientX: number, clientY: number) {
       const rect = canvas.getBoundingClientRect();
@@ -380,7 +386,9 @@ export default function Home() {
       // only count as real movement if above dead zone
       if (Math.abs(dx) > MOVE_DEADZONE || Math.abs(dy) > MOVE_DEADZONE) {
         lastCursorMove = performance.now();
-        targetSaturation = 1.0;
+        agentTargetSatRef.current = 1.0; // user is active — restore color
+        paintCount++;
+        paintMovement += Math.sqrt(dx * dx + dy * dy);
       }
     }
 
@@ -395,6 +403,54 @@ export default function Home() {
       prevX = t.clientX;
       prevY = t.clientY;
     }, { passive: false });
+
+    // --- agent: every 2s, send paint stats to Claude, apply response ---
+    const disturberInterval = setInterval(async () => {
+      if (pendingRef.current) return;
+      const idleSec  = (performance.now() - lastCursorMove) / 1000;
+      const count    = paintCount;
+      const movement = paintMovement;
+      paintCount    = 0;
+      paintMovement = 0;
+
+      if (count === 0 && idleSec < 2) return; // nothing interesting yet
+
+      pendingRef.current = true;
+      try {
+        const res = await fetch("/api/disturber", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            splatCount:        count,
+            totalMovement:     +movement.toFixed(3),
+            idleSec:           +idleSec.toFixed(1),
+            currentSaturation: +saturation.toFixed(3),
+            currentHue:        Math.round(hue),
+            narrative:         narrativeRef.current,
+          }),
+        });
+        const data = await res.json();
+        if (data.narrativeUpdate) narrativeRef.current = data.narrativeUpdate;
+        for (const d of (data.disturbances ?? [])) {
+          if (d.action === "add_splats") {
+            for (let i = 0; i < (d.count ?? 3); i++) {
+              agentSplatQueueRef.current.push({
+                x: Math.random(), y: Math.random(),
+                dx: (Math.random() - 0.5) * 1000,
+                dy: (Math.random() - 0.5) * 1000,
+                color: hslToRgb(Math.random() * 360, 1, 0.5),
+              });
+            }
+          } else if (d.action === "set_saturation") {
+            agentTargetSatRef.current = d.value;
+          }
+        }
+      } catch (err) {
+        console.error("Agent error:", err);
+      } finally {
+        pendingRef.current = false;
+      }
+    }, 2000);
 
     // --- splat function ---
     function doSplat(x: number, y: number, dx: number, dy: number, color: { r: number; g: number; b: number }) {
@@ -504,7 +560,6 @@ export default function Home() {
 
     // --- animation loop ---
     let lastTime = performance.now();
-    let lastLog = performance.now();
     let animId: number;
 
     function loop() {
@@ -518,21 +573,15 @@ export default function Home() {
       }
       splatQueue = [];
 
-      // idle for IDLE_AFTER_MS → go monochrome
-      if (now - lastCursorMove >= IDLE_AFTER_MS) {
-        targetSaturation = 0.0;
+      // drain agent splat queue into simulation
+      for (const s of agentSplatQueueRef.current.splice(0)) {
+        doSplat(s.x, s.y, s.dx, s.dy, s.color);
       }
 
-      // log every 2s
-      if (now - lastLog >= 2000) {
-        lastLog = now;
-        const idleSec = ((now - lastCursorMove) / 1000).toFixed(1);
-        console.log(`[disturber] idle=${idleSec}s  saturation=${saturation.toFixed(3)}  target=${targetSaturation}`);
-      }
-
-      // drain to gray (~3s), fast restore on movement (~0.3s)
-      const lerpSpeed = targetSaturation < saturation ? 0.8 : 6.0;
-      saturation += (targetSaturation - saturation) * Math.min(dt * lerpSpeed, 1);
+      // lerp saturation toward agent's target
+      const target = agentTargetSatRef.current;
+      const lerpSpeed = target < saturation ? 0.8 : 6.0;
+      saturation += (target - saturation) * Math.min(dt * lerpSpeed, 1);
 
       step(dt);
 
@@ -556,6 +605,7 @@ export default function Home() {
 
     return () => {
       cancelAnimationFrame(animId);
+      clearInterval(disturberInterval);
       window.removeEventListener("resize", onResize);
     };
   }, []);
