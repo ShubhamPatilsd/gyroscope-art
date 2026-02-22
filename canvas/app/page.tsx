@@ -292,10 +292,77 @@ function hslToRgb(h: number, s: number, l: number) {
 
 // ======================== COMPONENT ========================
 
+// ======================== PARTICLES ========================
+
 type Splat = { x: number; y: number; dx: number; dy: number; color: { r: number; g: number; b: number } };
+
+type Particle = {
+  x: number; y: number;
+  vx: number; vy: number;
+  life: number; maxLife: number;
+  size: number;
+  hue: number;
+};
+
+function spawnBurst(
+  particles: Particle[],
+  cx: number, cy: number,
+  count: number, speed: number, hue: number
+) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const v = speed * (0.3 + Math.random() * 0.7);
+    const maxLife = 1.5 + Math.random() * 2;
+    particles.push({
+      x: cx, y: cy,
+      vx: Math.cos(angle) * v,
+      vy: Math.sin(angle) * v,
+      life: maxLife, maxLife,
+      size: 2 + Math.random() * 4,
+      hue,
+    });
+  }
+}
+
+function updateParticles(particles: Particle[], dt: number) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= 0.98;
+    p.vy *= 0.98;
+    p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+function drawParticles(
+  ctx: CanvasRenderingContext2D,
+  particles: Particle[],
+  w: number, h: number
+) {
+  ctx.clearRect(0, 0, w, h);
+  ctx.globalCompositeOperation = "lighter";
+  for (const p of particles) {
+    const t = p.life / p.maxLife;
+    const alpha = t * t;
+    const r = p.size * (1 + (1 - t) * 2);
+    const px = p.x * w;
+    const py = (1 - p.y) * h;
+    const grad = ctx.createRadialGradient(px, py, 0, px, py, r);
+    grad.addColorStop(0, `hsla(${p.hue}, 80%, 90%, ${alpha})`);
+    grad.addColorStop(0.4, `hsla(${p.hue}, 90%, 60%, ${alpha * 0.5})`);
+    grad.addColorStop(1, `hsla(${p.hue}, 100%, 40%, 0)`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(px - r, py - r, r * 2, r * 2);
+  }
+}
+
+// ======================== COMPONENT ========================
 
 export default function Home() {
   const canvasRef          = useRef<HTMLCanvasElement>(null);
+  const particleCanvasRef  = useRef<HTMLCanvasElement>(null);
   const agentSplatQueueRef = useRef<Splat[]>([]);
   const agentTargetSatRef  = useRef(1.0);
   const narrativeRef       = useRef("");
@@ -392,17 +459,20 @@ export default function Home() {
       }
     }
 
-    canvas.addEventListener("mousemove", (e) => updatePointer(e.clientX, e.clientY));
-    canvas.addEventListener("touchmove", (e) => {
+    const onMouseMove = (e: MouseEvent) => updatePointer(e.clientX, e.clientY);
+    const onTouchMove = (e: TouchEvent) => {
       e.preventDefault();
       updatePointer(e.touches[0].clientX, e.touches[0].clientY);
-    }, { passive: false });
-    canvas.addEventListener("touchstart", (e) => {
+    };
+    const onTouchStart = (e: TouchEvent) => {
       e.preventDefault();
-      const t = e.touches[0];
-      prevX = t.clientX;
-      prevY = t.clientY;
-    }, { passive: false });
+      prevX = e.touches[0].clientX;
+      prevY = e.touches[0].clientY;
+    };
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("touchmove", onTouchMove, { passive: false });
+    window.addEventListener("touchstart", onTouchStart, { passive: false });
 
     // --- agent: every 2s, send paint stats to Claude, apply response ---
     const disturberInterval = setInterval(async () => {
@@ -487,6 +557,63 @@ export default function Home() {
     }
 
     randomSplats(Math.floor(Math.random() * 5) + 5);
+
+    // --- particle overlay ---
+    const pCanvas = particleCanvasRef.current!;
+    pCanvas.width = window.innerWidth;
+    pCanvas.height = window.innerHeight;
+    const pCtx = pCanvas.getContext("2d")!;
+    const particles: Particle[] = [];
+
+    // --- keyboard → splats + particles ---
+    const keyTimes: number[] = [];
+    let keyHue = Math.random() * 360;
+
+    function getTypingSpeed() {
+      const now = performance.now();
+      // keep only last 2 seconds
+      while (keyTimes.length > 0 && now - keyTimes[0] > 2000) keyTimes.shift();
+      return keyTimes.length / 2; // keys per second
+    }
+
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.repeat) return;
+      const now = performance.now();
+      keyTimes.push(now);
+      const speed = getTypingSpeed();
+
+      // intensity scales with typing speed: 1-15 kps
+      const intensity = Math.min(speed / 10, 1);
+      const particleCount = Math.floor(8 + intensity * 40);
+      const particleSpeed = 0.05 + intensity * 0.25;
+      const splatForce = 500 + intensity * 4000;
+
+      // random position on canvas
+      const x = 0.15 + Math.random() * 0.7;
+      const y = 0.15 + Math.random() * 0.7;
+
+      // cycle hue faster with typing speed
+      keyHue = (keyHue + 15 + speed * 8) % 360;
+      const color = hslToRgb(keyHue, 1, 0.5);
+
+      // fluid splat
+      const angle = Math.random() * Math.PI * 2;
+      doSplat(
+        x, y,
+        Math.cos(angle) * splatForce,
+        Math.sin(angle) * splatForce,
+        color
+      );
+
+      // particle burst
+      spawnBurst(particles, x, y, particleCount, particleSpeed, keyHue);
+
+      // keyboard counts as activity → restore color
+      lastCursorMove = performance.now();
+      agentTargetSatRef.current = 1.0;
+    }
+
+    window.addEventListener("keydown", onKeyDown);
 
     // --- simulation step ---
     function step(dt: number) {
@@ -591,6 +718,10 @@ export default function Home() {
       gl.uniform1f(progs.display.uniforms.uSaturation, saturation);
       blit(null);
 
+      // --- particles ---
+      updateParticles(particles, dt);
+      drawParticles(pCtx, particles, pCanvas.width, pCanvas.height);
+
       animId = requestAnimationFrame(loop);
     }
 
@@ -600,6 +731,8 @@ export default function Home() {
     function onResize() {
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
+      pCanvas.width = window.innerWidth;
+      pCanvas.height = window.innerHeight;
     }
     window.addEventListener("resize", onResize);
 
@@ -607,14 +740,24 @@ export default function Home() {
       cancelAnimationFrame(animId);
       clearInterval(disturberInterval);
       window.removeEventListener("resize", onResize);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("touchmove", onTouchMove);
+      window.removeEventListener("touchstart", onTouchStart);
     };
   }, []);
 
   return (
-    <canvas
-      ref={canvasRef}
-      className="block w-screen h-screen"
-      style={{ cursor: "crosshair" }}
-    />
+    <>
+      <canvas
+        ref={canvasRef}
+        className="fixed inset-0 w-screen h-screen"
+        style={{ cursor: "crosshair" }}
+      />
+      <canvas
+        ref={particleCanvasRef}
+        className="fixed inset-0 w-screen h-screen pointer-events-none"
+      />
+    </>
   );
 }
